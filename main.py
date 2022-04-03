@@ -130,4 +130,59 @@ def test_dot_product_attention():
     #                  xlabel='Keys', ylabel='Queries')
     d2l.plt.show()
 
-test_dot_product_attention()
+# Bahdanau 注意⼒
+class AttentionDecoder(d2l.Decoder):
+    """带注意力机制的解码器接口"""
+    def __init__(self, **kwargs):
+        super(AttentionDecoder, self).__init__(**kwargs)
+
+    @property
+    def attention_weights(self):
+        raise NotImplementedError
+
+# 为了更好地理解S2SAttentionDecoder，重新实现一下Seq2SeqEncoder，但是最后不调用
+class Seq2SeqEncoder(d2l.Encoder):
+    def __init__(self,vocab_size, embed_size, num_hidden, num_layers, dropout=0., **kwargs):
+        super(Seq2SeqEncoder, self).__init__(**kwargs)
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.GRU(num_hidden+embed_size, num_hidden, num_layers, dropout=dropout)
+        # GRU输出有两个，分别是output和h_n
+        # output 的shape是：(seq_len, batch, num_directions * hidden_size)
+        # h_n的shape是：(num_layers * num_directions, batch, hidden_size)
+
+    def forward(self, X):
+        """
+        :param: X输入的形状为（batch_size，时间步长/seq_len）
+        :return  output, hidden_state
+        # outputs的形状为(batch_size，num_steps，num_hiddens).
+        # hidden_state的形状为(num_layers，batch_size，num_hiddens)
+        """
+        X = self.embedding(X) # 输出为[seq_len,batch_size,embedding_size]
+        X = X.permute(1, 0, 2)
+        output,state = self.rnn(X)
+        return output, state
+
+
+class Seq2SeqAttentionDecoder(AttentionDecoder):
+    def __init__(self, vocab_size, embed_size, num_hidden, num_layers, dropout=0., **kwargs):
+        super(Seq2SeqAttentionDecoder, self).__init__(**kwargs)
+        # 一般把网络中可学习的层放到__init__函数中
+        # 一般把不具有可学习参数的层(如ReLU、dropout、BatchNormanation层)可放在构造函数中，这样层次更清晰，但是不放进去也行
+        self.attention = AdditiveAttention(num_hidden, num_hidden, num_hidden, dropout)
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.GRU(num_hidden+embed_size, num_hidden, num_layers, dropout=dropout)
+        self.dense = nn.Linear(num_hidden, vocab_size) # 用来预测每一步的输出
+
+    def init_state(self, enc_outputs, enc_valid_lens, *args):
+        # outputs的形状为(batch_size，num_steps，num_hiddens).
+        # hidden_state的形状为(num_layers，batch_size，num_hiddens)
+        outputs, hidden_state = enc_outputs
+        return outputs.permute(1, 0, 2), hidden_state, enc_valid_lens # 就是一个辅助的函数，把batch_size 放到了dim=1的位置
+
+    def forward(self, X, state):
+        X = self.embedding(X)
+        X = X.permute(1, 0, 2)
+        outputs, hidden_state, enc_valid_lens = state
+
+        outputs, self._attention_weights = [], []
+
