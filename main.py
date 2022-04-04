@@ -107,7 +107,7 @@ class DotProductAttention(nn.Module):
                 value的形状（batch_size，键值对的个数，value_size）
                 query的形状（batch_size，查询的个数，dimension）
                 valid_lens的形状:(batch_size，)或者(batch_size，查询的个数)
-        :return
+        :return: 输出的形状（batch_size，查询的个数，value_size）
 
         """
         d = query.shape[-1]
