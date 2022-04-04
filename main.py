@@ -59,6 +59,13 @@ def masked_softmax(scores, valid_len):
 
 # 加性注意力层,不管是自定义层、自定义块、自定义模型，都是通过继承Module类完成的
 class AdditiveAttention(nn.Module):
+    """
+             :arg: 输入queries的形状（batch_size，查询的个数，query_size）
+              输入key的形状（batch_size，键值对的个数，key_size）
+              维度扩展后，queries的形状（batch_size，查询的个数，1，num_hidden）
+              维度扩展后，key的形状（batch_size，1，“键－值”对的个数，num_hidden)，维度扩展的目的是广播
+             :return: 输出的形状（batch_size，查询的个数，value_size）
+          """
     def __init__(self, key_size, query_size, num_hidden, dropout=0., **kwargs):
         super(AdditiveAttention, self).__init__(**kwargs)
         # https://docs.pythontab.com/interpy/args_kwargs/Usage_kwargs/ **kwargs的用法，其实就是让程序可扩展性更好，后面并没有用到
@@ -70,14 +77,6 @@ class AdditiveAttention(nn.Module):
 
     def forward(self, queries, key, value, valid_length): # forward函数需要传入真正的实参
         keys, queries = self.W_k(key), self.W_q(queries) # 类调用的时候需要写self
-        """
-           :arg: 输入queries的形状（batch_size，查询的个数，query_size）
-            输入key的形状（batch_size，键值对的个数，key_size）
-            维度扩展后，queries的形状（batch_size，查询的个数，1，num_hidden）
-            维度扩展后，key的形状（batch_size，1，“键－值”对的个数，num_hidden)，维度扩展的目的是广播
-           :return: 输出的形状（batch_size，查询的个数，value_size）
-        """
-
         keys = keys.unsqueeze(1)
         queries = queries.unsqueeze(2)
         features =torch.tanh(queries + keys)
@@ -142,10 +141,10 @@ class AttentionDecoder(d2l.Decoder):
 
 # 为了更好地理解S2SAttentionDecoder，重新实现一下Seq2SeqEncoder，但是最后不调用
 class Seq2SeqEncoder(d2l.Encoder):
-    def __init__(self,vocab_size, embed_size, num_hidden, num_layers, dropout=0., **kwargs):
+    def __init__(self, vocab_size, embed_size, num_hidden, num_layers, dropout=0., **kwargs):
         super(Seq2SeqEncoder, self).__init__(**kwargs)
         self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = nn.GRU(num_hidden+embed_size, num_hidden, num_layers, dropout=dropout)
+        self.rnn = nn.GRU(embed_size, num_hidden, num_layers, dropout=dropout)
         # GRU输出有两个，分别是output和h_n
         # output 的shape是：(seq_len, batch, num_directions * hidden_size)
         # h_n的shape是：(num_layers * num_directions, batch, hidden_size)
@@ -159,9 +158,18 @@ class Seq2SeqEncoder(d2l.Encoder):
         """
         X = self.embedding(X) # 输出为[seq_len,batch_size,embedding_size]
         X = X.permute(1, 0, 2)
-        output,state = self.rnn(X)
+        output, state = self.rnn(X)
         return output, state
 
+def test_encoder():
+    encoder = Seq2SeqEncoder(vocab_size=10, embed_size=8, num_hidden=16, num_layers=2)
+    encoder.eval()
+    X = torch.zeros((4, 7), dtype=torch.long)
+    output, state = encoder(X)
+    print(output.shape)
+    print(state.shape)
+    print(state[-1].shape) # state[-1]代表最后一层隐藏层h_t的输出 torch.Size([4, 16])
+    print(torch.unsqueeze(state[-1], dim=1).shape) # torch.Size([4, 1, 16])
 
 class Seq2SeqAttentionDecoder(AttentionDecoder):
     def __init__(self, vocab_size, embed_size, num_hidden, num_layers, dropout=0., **kwargs):
@@ -180,9 +188,34 @@ class Seq2SeqAttentionDecoder(AttentionDecoder):
         return outputs.permute(1, 0, 2), hidden_state, enc_valid_lens # 就是一个辅助的函数，把batch_size 放到了dim=1的位置
 
     def forward(self, X, state):
-        X = self.embedding(X)
-        X = X.permute(1, 0, 2)
-        outputs, hidden_state, enc_valid_lens = state
+        X = self.embedding(X) # 输出为N×W×embedding_dim, N是batch size，W是序列的长度
+        X = X.permute(1, 0, 2) # 把batch_size放到中间
+        enc_outputs, hidden_state, enc_valid_lens = state
 
         outputs, self._attention_weights = [], []
+        for x in X: # x的size是（batch_size，embedding_size），重复序列长度次
+            query = torch.unsqueeze(hidden_state[-1], dim=1) # 为了维度的匹配，需要unsqueeze，这里面查询的个数为1，所以直接unsqueeze就行了
+            score = self.attention(query, enc_outputs, enc_outputs, enc_valid_lens)
+            dec_input = torch.cat((score, torch.unsqueeze(x, dim=1)), dim=-1) # 在特征维度连接
+            out, hidden_state = self.rnn(dec_input.permute(1, 0, 2), hidden_state) # 更新查询的query，第一次用的是enc最后一层的ht，以后就用decoder的st
+            outputs.append(out)
+            self._attention_weights.append(self.attention.attention_weights)
+
+        outputs = self.dense(torch.cat(outputs, dim=0)) # 在输出的sen_len（也就是num_steps)维度拼接
+        # 全连接层变换后，outputs的形状为(num_steps,batch_size,vocab_size)
+        return outputs.permute(1, 0, 2), [enc_outputs, hidden_state, enc_valid_lens]
+
+    @property
+    def attention_weights(self):
+        return self._attention_weights
+
+def test_Seq2SeqAttentionDecoder():
+    encoder = d2l.Seq2SeqEncoder(vocab_size=10, embed_size=8, num_hiddens=16, num_layers=2)
+    encoder.eval()
+    decoder = Seq2SeqAttentionDecoder(vocab_size=10, embed_size=8, num_hidden=16, num_layers=2)
+    decoder.eval()
+    X = torch.zeros((4, 7), dtype=torch.long) # (batch_size,num_steps)
+    state = decoder.init_state(encoder(X), None)
+    output, state = decoder(X, state)
+    print(output.shape, len(state), state[0].shape, len(state[1]), state[1][0].shape)
 
